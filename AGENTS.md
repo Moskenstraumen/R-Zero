@@ -3,7 +3,12 @@
 This codebase used to be veRL based and can use `git diff` to check previous codes.
 
 ## Project Structure & Module Organization
-`customization/` (imported as `slime_customization`) contains custom rollout/reward hooks and shared reward logic (for example `customization/math.py`). `scripts/` holds the training drivers and data utilities. `question_generate/` and `question_evaluate/` handle question generation and evaluation helpers. Assets live in `figs/`; repo-level config includes `requirements.txt` and `tokens.json`.
+`customization/` contains R-Zero training customization modules: `customization/questioner_data_source.py` for questioner prompt/data sampling, `customization/reward_model.py` for questioner/solver reward functions, and shared reward logic in `customization/math.py`. `scripts/` holds the training drivers and data utilities. `question_generate/` and `question_evaluate/` handle question generation and evaluation helpers. Assets live in `figs/`; repo-level config includes `requirements.txt` and `tokens.json`.
+
+Training wiring notes:
+- `scripts/questioner_train.sh` uses `customization.questioner_data_source.QuestionerDataSource` and `customization.reward_model.questioner_rm_group`.
+- `scripts/solver_train.sh` uses `customization.reward_model.solver_rm`.
+- Rollout uses slime default rollout function (`slime.rollout.sglang_rollout.generate_rollout`); no repo-local rollout wrapper is used.
 
 ## Build, Test, and Development Commands
 Common commands used in this repo:

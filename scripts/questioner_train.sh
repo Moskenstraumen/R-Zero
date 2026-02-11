@@ -46,7 +46,7 @@ CKPT_ARGS=(
 )
 
 ROLLOUT_ARGS=(
-  --data-source-path customization.rzero_hooks.QuestionerDataSource
+  --data-source-path customization.questioner_data_source.QuestionerDataSource
   --num-rollout 1
   --num-steps-per-rollout 6
   --rollout-batch-size 24
@@ -105,8 +105,7 @@ MISC_ARGS=(
 )
 
 CUSTOM_ARGS=(
-  --rollout-function-path customization.rzero_rollout.generate_rollout
-  --custom-rm-path customization.rzero_hooks.questioner_rm_group
+  --custom-rm-path customization.reward_model.questioner_rm_group
   --group-rm
   --rm-url "${RZERO_SOLVER_RM_URL}"
 )
