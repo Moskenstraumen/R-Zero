@@ -66,7 +66,14 @@ ROLLOUT_ARGS=(
   --balance-data
 )
 
-EVAL_ARGS=()
+EVAL_ARGS=(
+  --eval-interval 1
+  --eval-prompt-data aime  /root/dataset/aime-2024/aime-2024.jsonl
+  --n-samples-per-eval-prompt 8
+  --eval-max-response-len 8192
+  --eval-top-p 1
+  --skip-eval-before-train
+)
 
 GRPO_ARGS=(
   --advantage-estimator grpo
