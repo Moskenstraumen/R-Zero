@@ -14,7 +14,7 @@ Check  out our [paper](https://arxiv.org/abs/2508.05004) or [webpage](https://ch
 
 - [2025-8-27] We’ve added analysis on iteration scaling and one model taking on two roles.
 
-- [2025-8-25] Update codes to make training more smooth (by stopit).
+- [2025-8-25] Update codes to make training more smooth.
 
 - [2025-8-8] R-Zero got `#2 Paper of the day` in [huggingface daily paper](https://huggingface.co/papers/2508.05004).
 

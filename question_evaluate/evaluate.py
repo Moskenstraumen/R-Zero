@@ -1,188 +1,299 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-'''
-Description:
-    This script evaluates generated answers against golden answers for a set of questions.
-    It uses vLLM for efficient generation and a robust, timed grading mechanism to score the results.
-    The script is designed to run as a batch job, often in parallel across multiple GPUs.
 
-Refactoring Notes:
-    - Replaced 'timeout-decorator' with the thread-safe 'stopit' library to provide robust
-      timeout protection for the grading function without causing errors.
-    - Optimized the answer comparison logic to perform cheap checks first, only calling the
-      expensive grading function when necessary.
-    - Improved error handling and code structure for better readability and stability.
-
-Setup:
-    pip install stopit transformers torch vllm
-
-Example Usage (in a shell script):
-    # This would run the script for GPU 0, with a specific model and save name.
-    CUDA_VISIBLE_DEVICES=0 python evaluate.py --model "Qwen/Qwen3-4B-Base" --suffix 0 --save_name "my_experiment" &
-'''
-
-import json
-import vllm
-from transformers import AutoTokenizer
 import argparse
-import re
+import json
 import os
-import stopit  # Use the robust, thread-safe stopit library for timeouts
+import time
+import requests
+from transformers import AutoTokenizer
 from mathruler.grader import extract_boxed_content, grade_answer
 
-# --- Argument Parsing ---
-parser = argparse.ArgumentParser(description="Evaluate generated questions using vLLM.")
-parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B-Base", help="Path to the model in Hugging Face format.")
-parser.add_argument("--num_samples", type=int, default=9, help="Number of candidate answers to generate per question (n).")
-parser.add_argument("--suffix", type=str, default="0", help="A unique suffix for file naming, often the GPU index.")
-parser.add_argument("--save_name", type=str, required=True, help="A base name for input and output files.")
-args = parser.parse_args()
 
-# --- Constants and Paths ---
-STORAGE_PATH = os.getenv("STORAGE_PATH", "/apdcephfs_sh2/share_300000800/user/chengchuang")
-INPUT_FILE = f"{STORAGE_PATH}/generated_question/{args.save_name}_{args.suffix}.json"
-OUTPUT_FILE = f"{STORAGE_PATH}/generated_question/{args.save_name}_{args.suffix}_results.json"
+DEFAULT_STORAGE_PATH = "/root/dataset/R-Zero"
+DEFAULT_SOLVER_URL = "http://127.0.0.1:15200/generate"
+DEFAULT_MODEL_PATH = "/root/model/R-Zero/solver_reward_hf"
+DEFAULT_MAX_NEW_TOKENS = 4096
+DEFAULT_REQUEST_TIMEOUT = 600
+DEFAULT_REQUEST_RETRIES = 2
+DEFAULT_PROGRESS_EVERY = 20
 
-# --- Timeout-Protected Grading Function ---
-@stopit.threading_timeoutable(default='TIMED_OUT')
-def grade_answer_with_timeout(res1, res2):
-    """
-    Wraps the mathruler 'grade_answer' function with a timeout.
-    If the function takes too long, it returns 'TIMED_OUT' instead of hanging.
-    """
-    # The actual timeout value is passed as a keyword argument on each call.
-    return grade_answer(res1, res2)
-
-# --- Main Script Logic ---
-
-# 1. Load and Prepare Data
-print(f"[{args.suffix}] Loading data from: {INPUT_FILE}")
 try:
-    with open(INPUT_FILE, "r") as f:
-        data = json.load(f)
-    # Clean up the input file immediately after loading to save space
-    os.remove(INPUT_FILE)
-except FileNotFoundError:
-    print(f"[{args.suffix}] ERROR: Input file not found. Exiting.")
-    exit()
+    import stopit
 
-# Filter data into questions that need processing
-correct_data = [item for item in data if item.get('score') == 0]
-if not correct_data:
-    print(f"[{args.suffix}] No new questions to process (score=0). Exiting.")
-    # Create an empty results file to signal completion
-    with open(OUTPUT_FILE, "w") as f:
-        json.dump([], f)
-    exit()
+    @stopit.threading_timeoutable(default="TIMED_OUT")
+    def grade_answer_with_timeout(res1, res2):
+        return grade_answer(res1, res2)
 
-questions = [item["question"] for item in correct_data]
-answers = [item["answer"] for item in correct_data]
-print(f"[{args.suffix}] Found {len(questions)} questions to process.")
+    STOPIT_AVAILABLE = True
+except Exception:
+    STOPIT_AVAILABLE = False
 
-# 2. Initialize Model and Tokenizer
-print(f"[{args.suffix}] Initializing vLLM for model: {args.model}")
-tokenizer = AutoTokenizer.from_pretrained(args.model)
-model = vllm.LLM(
-    model=args.model,
-    tokenizer=args.model,
-    gpu_memory_utilization=0.85,
-    seed=int(args.suffix),
-)
-sample_params = vllm.SamplingParams(
-    max_tokens=4096,
-    temperature=1.0,
-    top_p=1.0,
-    top_k=40,
-    stop_token_ids=[tokenizer.eos_token_id],
-    n=args.num_samples,
-)
+    def grade_answer_with_timeout(res1, res2):
+        return grade_answer(res1, res2)
 
-# 3. Generate Responses
-print(f"[{args.suffix}] Generating {args.num_samples} samples for each question...")
-chats = [[{"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},{"role": "user", "content": q}] for q in questions]
 
-if tokenizer.chat_template:
-    prompts = [tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True, add_special_tokens=True) for chat in chats]
-else:
-    prompts = ["system: " + chat[0]["content"] + '\n' + "user: " + chat[1]["content"] for chat in chats]
+def build_prompt(tokenizer, question):
+    chat = [
+        {"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},
+        {"role": "user", "content": question},
+    ]
+    if tokenizer.chat_template:
+        return tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True, add_special_tokens=True)
+    return "system: " + chat[0]["content"] + "\n" + "user: " + chat[1]["content"]
 
-responses = model.generate(prompts, sampling_params=sample_params, use_tqdm=True)
-print(f"[{args.suffix}] Generation complete.")
 
-# 4. Process and Grade Responses
-results_all = []
-print(f"[{args.suffix}] Grading responses...")
-for response, golden_answer, question in zip(responses, answers, questions):
+def sglang_generate_batch(solver_url, prompts, sampling_params, request_timeout):
+    payload = {"text": prompts, "sampling_params": sampling_params}
+    res = requests.post(solver_url, json=payload, timeout=request_timeout)
+    res.raise_for_status()
+    obj = res.json()
+    texts = []
+    if isinstance(obj, dict):
+        raw_texts = obj.get("text", [])
+        if isinstance(raw_texts, str):
+            texts = [raw_texts]
+        elif isinstance(raw_texts, list):
+            texts = [text for text in raw_texts if isinstance(text, str)]
+    elif isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, dict):
+                text = item.get("text", "")
+                if isinstance(text, str):
+                    texts.append(text)
+            elif isinstance(item, str):
+                texts.append(item)
+    else:
+        raise ValueError(f"Unexpected response type from SGLang: {type(obj).__name__}")
+
+    if len(texts) < len(prompts):
+        texts.extend([""] * (len(prompts) - len(texts)))
+    elif len(texts) > len(prompts):
+        texts = texts[: len(prompts)]
+    return texts
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate generated questions using SGLang.")
+    parser.add_argument(
+        "--model",
+        "--model-path",
+        dest="model_path",
+        default=os.getenv("MODEL_PATH", DEFAULT_MODEL_PATH),
+        help="HF path used for tokenization.",
+    )
+    parser.add_argument("--num_samples", type=int, default=int(os.getenv("QUESTION_EVAL_NUM_SAMPLES", 9)))
+    parser.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=int(os.getenv("QUESTION_EVAL_MAX_NEW_TOKENS", DEFAULT_MAX_NEW_TOKENS)),
+    )
+    parser.add_argument(
+        "--request-timeout",
+        dest="request_timeout",
+        type=int,
+        default=int(os.getenv("QUESTION_EVAL_REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT)),
+    )
+    parser.add_argument(
+        "--request-retries",
+        dest="request_retries",
+        type=int,
+        default=int(os.getenv("QUESTION_EVAL_REQUEST_RETRIES", DEFAULT_REQUEST_RETRIES)),
+    )
+    parser.add_argument(
+        "--progress-every",
+        dest="progress_every",
+        type=int,
+        default=int(os.getenv("QUESTION_EVAL_PROGRESS_EVERY", DEFAULT_PROGRESS_EVERY)),
+    )
+    parser.add_argument("--suffix", type=str, default="0", help="Shard suffix (typically GPU index).")
+    parser.add_argument("--save_name", type=str, required=True, help="Base name for input/output files.")
+    parser.add_argument(
+        "--solver-url",
+        dest="solver_url",
+        default=os.getenv("RZERO_SOLVER_RM_URL")
+        or os.getenv("SOLVER_SGLANG_URL")
+        or os.getenv("SOLVER_URL")
+        or DEFAULT_SOLVER_URL,
+    )
+    return parser.parse_args()
+
+
+def _normalize_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
+def _safe_grade(lhs, rhs):
+    lhs_text = _normalize_text(lhs)
+    rhs_text = _normalize_text(rhs)
+    if not lhs_text or not rhs_text:
+        return False
+
     try:
-        # Extract the boxed content from all generated samples
-        results = [extract_boxed_content(output.text) for output in response.outputs]
-        results = [res for res in results if res] # Filter out None/empty results
+        if STOPIT_AVAILABLE:
+            matched = grade_answer_with_timeout(lhs_text, rhs_text, timeout=10)
+            return matched != "TIMED_OUT" and bool(matched)
+        return bool(grade_answer_with_timeout(lhs_text, rhs_text))
+    except Exception:
+        return False
 
-        if not results:
-            print(f"[{args.suffix}] WARNING: No valid boxed answers found for question: '{question[:50]}...'")
+
+def _safe_remove_file(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def main():
+    args = _parse_args()
+
+    storage_path = os.getenv("STORAGE_PATH", DEFAULT_STORAGE_PATH)
+    input_file = os.path.join(storage_path, "generated_question", f"{args.save_name}_{args.suffix}.json")
+    output_file = os.path.join(storage_path, "generated_question", f"{args.save_name}_{args.suffix}_results.json")
+
+    print(f"[{args.suffix}] Loading data from: {input_file}")
+    try:
+        with open(input_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f"[{args.suffix}] ERROR: Input file not found. Exiting.")
+        return
+
+    correct_data = [item for item in data if item.get("score") == 0]
+    if not correct_data:
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump([], f)
+        _safe_remove_file(input_file)
+        return
+
+    questions, answers = [], []
+    for item in correct_data:
+        question = _normalize_text(item.get("question"))
+        answer = _normalize_text(item.get("answer"))
+        if not question or not answer:
+            continue
+        questions.append(question)
+        answers.append(answer)
+
+    if not questions:
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump([], f)
+        _safe_remove_file(input_file)
+        return
+
+    print(f"[{args.suffix}] Initializing tokenizer for model: {args.model_path}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    sampling_params = {
+        "max_new_tokens": args.max_new_tokens,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": 40,
+        "stop_token_ids": [tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else [],
+        "n": 1,
+        "skip_special_tokens": True,
+        "no_stop_trim": True,
+    }
+
+    total_questions = len(questions)
+    print(f"[{args.suffix}] Questions to evaluate: {total_questions}")
+    print(
+        f"[{args.suffix}] Generating {args.num_samples} samples/question "
+        f"(max_new_tokens={args.max_new_tokens}, request_timeout={args.request_timeout}s, retries={args.request_retries})..."
+    )
+
+    start_time = time.time()
+    results_all = []
+    for idx, (question, golden_answer) in enumerate(zip(questions, answers), start=1):
+        try:
+            prompt = build_prompt(tokenizer, question)
+            prompts = [prompt] * args.num_samples
+            outputs = None
+            for attempt in range(args.request_retries + 1):
+                try:
+                    outputs = sglang_generate_batch(
+                        args.solver_url,
+                        prompts,
+                        sampling_params,
+                        request_timeout=args.request_timeout,
+                    )
+                    break
+                except requests.RequestException as exc:
+                    if attempt >= args.request_retries:
+                        raise
+                    print(
+                        f"[{args.suffix}] WARN request failed ({attempt + 1}/{args.request_retries + 1}), retrying: {exc}"
+                    )
+                    time.sleep(min(2 ** attempt, 5))
+
+            results = [_normalize_text(extract_boxed_content(output)) for output in outputs]
+            results = [res for res in results if res and res.lower() != "none"]
+
+            if results:
+                answer_counts = {}
+                for result in results:
+                    matched = False
+                    for existing_answer in list(answer_counts.keys()):
+                        if result == existing_answer or ("no " in result.lower() and "no " in existing_answer.lower()):
+                            answer_counts[existing_answer] += 1
+                            matched = True
+                            break
+
+                        if _safe_grade(result, existing_answer):
+                            answer_counts[existing_answer] += 1
+                            matched = True
+                            break
+
+                        if _safe_grade(existing_answer, result):
+                            answer_counts[existing_answer] += 1
+                            matched = True
+                            break
+
+                    if not matched:
+                        answer_counts[result] = 1
+
+                if answer_counts:
+                    majority_answer = max(answer_counts, key=answer_counts.get)
+                    max_count = answer_counts[majority_answer]
+                    score = max_count / len(results)
+
+                    if "证明" not in question and "box" not in question.lower() and "text" not in majority_answer.lower():
+                        results_all.append(
+                            {
+                                "question": question,
+                                "answer": majority_answer,
+                                "score": score,
+                                "results": results,
+                            }
+                        )
+        except requests.RequestException as exc:
+            print(f"[{args.suffix}] ERROR: solver request failed at {args.solver_url}: {exc}")
+            break
+
+        except Exception as exc:
+            print(f"[{args.suffix}] CRITICAL ERROR processing question '{question[:50]}...': {exc}")
             continue
 
-        answer_counts = {}
-        for result in results:
-            matched = False
-            for existing_answer in answer_counts:
-                # OPTIMIZATION: Perform cheap string comparisons first.
-                if result == existing_answer or ('no ' in result.lower() and 'no ' in existing_answer.lower()):
-                    answer_counts[existing_answer] += 1
-                    matched = True
-                    break
-                
-                # If cheap checks fail, use the expensive, timed grader.
-                # Check both directions (A vs B and B vs A).
-                match_1 = grade_answer_with_timeout(result, existing_answer, timeout=10)
-                if match_1 == 'TIMED_OUT':
-                    print(f"[{args.suffix}] GRADER TIMEOUT on: '{result[:30]}...' vs '{existing_answer[:30]}...'")
-                    continue # Skip to the next existing_answer
-                
-                if match_1:
-                    answer_counts[existing_answer] += 1
-                    matched = True
-                    break
+        if args.progress_every > 0 and (idx % args.progress_every == 0 or idx == total_questions):
+            elapsed = max(time.time() - start_time, 1e-6)
+            avg_sec_per_question = elapsed / idx
+            eta_sec = avg_sec_per_question * (total_questions - idx)
+            print(
+                f"[{args.suffix}] Progress {idx}/{total_questions} | kept={len(results_all)} | "
+                f"elapsed={elapsed / 60:.1f}m | eta={eta_sec / 60:.1f}m",
+                flush=True,
+            )
 
-                match_2 = grade_answer_with_timeout(existing_answer, result, timeout=10)
-                if match_2 == 'TIMED_OUT':
-                    print(f"[{args.suffix}] GRADER TIMEOUT on: '{existing_answer[:30]}...' vs '{result[:30]}...'")
-                    continue
+    print(f"[{args.suffix}] Processed {len(results_all)} questions. Saving results to: {output_file}")
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(results_all, f, indent=4)
 
-                if match_2:
-                    answer_counts[existing_answer] += 1
-                    matched = True
-                    break
+    _safe_remove_file(input_file)
 
-            if not matched:
-                answer_counts[result] = 1
 
-        if not answer_counts:
-            continue
-
-        # Determine the majority answer and its score
-        majority_answer = max(answer_counts, key=answer_counts.get)
-        max_count = answer_counts[majority_answer]
-        score = max_count / len(results)
-
-        # Skip certain question types that are hard to grade automatically
-        if "证明" in question or 'box' in question.lower() or 'text' in majority_answer.lower():
-            continue
-
-        results_all.append({
-            "question": question,
-            "answer": majority_answer,
-            "score": score,
-            'results': results
-        })
-
-    except Exception as e:
-        print(f"[{args.suffix}] CRITICAL ERROR processing question '{question[:50]}...': {e}")
-        continue
-
-# 5. Save Final Results
-print(f"[{args.suffix}] Processed {len(results_all)} questions. Saving results to: {OUTPUT_FILE}")
-with open(OUTPUT_FILE, "w") as f:
-    json.dump(results_all, f, indent=4)
-
-print(f"[{args.suffix}] Script finished.")
+if __name__ == "__main__":
+    main()

@@ -1,39 +1,159 @@
-solver_model_path=$1
-questioner_model_path=$2
-experiment_name=$3
+#!/bin/bash
 
-echo $STORAGE_PATH
+set -euo pipefail
 
-echo "start train solver $experiment_name $solver_model_path $questioner_model_path" 
+SOLVER_MODEL_PATH="$1"
+QUESTIONER_MODEL_PATH="$2"
+SAVE_NAME="$3"
 
-export VLLM_DISABLE_COMPILE_CACHE=1
-echo 'start generate question'
-bash question_generate/question_generate.bash $questioner_model_path 1000 $experiment_name
-echo 'start evaluate generated question'
-bash question_evaluate/evaluate.sh $solver_model_path $experiment_name
-echo 'start upload'
-python question_evaluate/upload.py --repo_name ${experiment_name} --max_score 0.8 --min_score 0.3 --experiment_name ${experiment_name}
-echo 'start train'
+SLIME_ROOT="${SLIME_ROOT:-/root/slime}"
+SGLANG_PYTHONPATH="${SGLANG_PYTHONPATH:-/sgl-workspace/sglang/python}"
+SOLVER_REF_LOAD="${SOLVER_REF_LOAD:-/root/model/Qwen3-4B-Instruct-2507_torch_dist}"
 
-python3 -m verl.trainer.main \
-    config=examples/config.yaml \
-    data.max_response_length=4096 \
-    worker.actor.model.model_path=$solver_model_path \
-    trainer.experiment_name=${experiment_name} \
-    trainer.save_checkpoint_path=${STORAGE_PATH}/models/${experiment_name}/ \
-    data.train_files=${HUGGINGFACENAME}/${experiment_name}@train \
-    trainer.total_epochs=100 \
-    trainer.max_steps=20 \
-    data.format_prompt=./examples/format_prompt/solver.jinja \
-    trainer.val_freq=4 \
-    worker.actor.micro_batch_size_per_device_for_update=1 \
-    worker.actor.micro_batch_size_per_device_for_experience=1 \
+SOLVER_SAVE_DIR="${SAVE_ROOT}/${SAVE_NAME}"
 
-echo "merging model"
-python scripts/model_merger.py --local_dir ${STORAGE_PATH}/models/${experiment_name}/global_step_15/actor
+MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8265}"
 
-sleep 10
+NUM_SOLVER_GPUS=$(echo "${SOLVER_ALL_GPUS}" | awk -F',' '{print NF}')
 
-echo "solver training finished"
+echo "Start solver training: ${SOLVER_MODEL_PATH} + ${QUESTIONER_MODEL_PATH} -> ${SOLVER_SAVE_DIR}"
 
-bash evaluation/evaluate.bash ${STORAGE_PATH}/models/${experiment_name}/global_step_15/actor/huggingface
+set -x
+
+SOLVER_DATA_FILE="${STORAGE_PATH}/solver_data/solver_current.jsonl"
+if [ ! -s "${SOLVER_DATA_FILE}" ]; then
+  echo "ERROR: solver training data is empty: ${SOLVER_DATA_FILE}"
+  echo "Hint: generated questions/evaluations likely failed or all scores were filtered out."
+  exit 1
+fi
+
+export PYTHONPATH="${SGLANG_PYTHONPATH}:/root/Megatron-LM:${RZERO_ROOT}:${SLIME_ROOT}:${PYTHONPATH:-}"
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export PYTHONBUFFERED=16
+
+RUNTIME_ENV_JSON="{
+  \"env_vars\": {
+    \"PYTHONPATH\": \"${SGLANG_PYTHONPATH}:/root/Megatron-LM:${RZERO_ROOT}:${SLIME_ROOT}\",
+    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\"
+  }
+}"
+
+source "${SLIME_ROOT}/scripts/models/qwen3-4B.sh"
+
+CKPT_ARGS=(
+  --hf-checkpoint "${SOLVER_MODEL_PATH}"
+  --ref-load "${SOLVER_REF_LOAD}"
+  --save "${SOLVER_SAVE_DIR}"
+  --save-interval 1
+  --save-hf "${SOLVER_SAVE_DIR}/hf/rollout_{rollout_id}"
+  --rotary-base 5000000
+)
+
+ROLLOUT_ARGS=(
+  --prompt-data "${SOLVER_DATA_FILE}"
+  --input-key prompt
+  --label-key answer
+  --apply-chat-template
+  --rollout-shuffle
+  --num-rollout 1
+  --num-steps-per-rollout 20
+  --rollout-batch-size 432
+  --n-samples-per-prompt 5
+  --global-batch-size 108
+  --rollout-max-response-len 4096
+  --rollout-max-prompt-len 2048
+  --balance-data
+)
+
+EVAL_ARGS=()
+
+GRPO_ARGS=(
+  --advantage-estimator grpo
+  --use-kl-loss
+  --kl-loss-coef 0.01
+  --kl-loss-type low_var_kl
+  --use-rollout-logprobs
+  --entropy-coef 0.0
+  --eps-clip 0.2
+  --eps-clip-high 0.28
+)
+
+OPTIMIZER_ARGS=(
+  --optimizer adam
+  --lr 1e-6
+  --lr-decay-style constant
+  --weight-decay 0.01
+  --adam-beta1 0.9
+  --adam-beta2 0.98
+)
+
+PERF_ARGS=(
+  --tensor-model-parallel-size 1
+  --sequence-parallel
+  --pipeline-model-parallel-size 1
+  --context-parallel-size 1
+  --expert-model-parallel-size 1
+  --expert-tensor-parallel-size 1
+  --recompute-granularity full
+  --recompute-method uniform
+  --recompute-num-layers 1
+  --use-dynamic-batch-size
+  --max-tokens-per-gpu 9216
+)
+
+SGLANG_ARGS=(
+  --rollout-num-gpus-per-engine 1
+  --sglang-mem-fraction-static 0.7
+)
+
+MISC_ARGS=(
+  --attention-dropout 0.0
+  --hidden-dropout 0.0
+  --accumulate-allreduce-grads-in-fp32
+  --attention-softmax-in-fp32
+  --attention-backend flash
+)
+
+CUSTOM_ARGS=(
+  --rollout-function-path customization.rzero_rollout.generate_rollout
+  --custom-rm-path customization.rzero_hooks.solver_rm
+)
+
+WANDB_PROJECT="${WANDB_PROJECT:-rzero}"
+WANDB_GROUP="${WANDB_GROUP:-${SAVE_NAME}}"
+WANDB_KEY="${WANDB_KEY:-${WANDB_KEY:-}}"
+WANDB_ARGS=(
+  --use-wandb
+  --wandb-project "${WANDB_PROJECT}"
+  --wandb-group "${WANDB_GROUP}"
+  --wandb-key "${WANDB_KEY}"
+)
+
+CUDA_VISIBLE_DEVICES="${SOLVER_ALL_GPUS}" ray start --head \
+  --node-ip-address "${MASTER_ADDR}" \
+  --num-gpus "${NUM_SOLVER_GPUS}" \
+  --disable-usage-stats \
+  --dashboard-host=0.0.0.0 \
+  --dashboard-port "${RAY_DASHBOARD_PORT}"
+
+ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
+  --runtime-env-json="${RUNTIME_ENV_JSON}" \
+  -- python3 "${SLIME_ROOT}/train.py" \
+  --train-backend megatron \
+  --actor-num-nodes 1 \
+  --actor-num-gpus-per-node "${NUM_SOLVER_GPUS}" \
+  --colocate \
+  "${MODEL_ARGS[@]}" \
+  "${CKPT_ARGS[@]}" \
+  "${ROLLOUT_ARGS[@]}" \
+  "${EVAL_ARGS[@]}" \
+  "${OPTIMIZER_ARGS[@]}" \
+  "${GRPO_ARGS[@]}" \
+  "${WANDB_ARGS[@]}" \
+  "${PERF_ARGS[@]}" \
+  "${SGLANG_ARGS[@]}" \
+  "${MISC_ARGS[@]}" \
+  "${CUSTOM_ARGS[@]}"
+
+echo "Solver training finished: ${SOLVER_SAVE_DIR}"
