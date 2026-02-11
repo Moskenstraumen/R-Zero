@@ -123,8 +123,7 @@ MISC_ARGS=(
 )
 
 CUSTOM_ARGS=(
-  --rollout-function-path customization.rzero_rollout.generate_rollout
-  --custom-rm-path customization.rzero_hooks.solver_rm
+  --custom-rm-path customization.reward_model.solver_rm
 )
 
 WANDB_PROJECT="${WANDB_PROJECT:-rzero}"

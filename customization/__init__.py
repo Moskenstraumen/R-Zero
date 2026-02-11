@@ -1,1 +1,1 @@
-"""Custom slime hooks for R-Zero."""
+"""Custom slime data source and reward modules for R-Zero."""
