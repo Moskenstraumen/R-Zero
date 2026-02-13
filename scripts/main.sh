@@ -68,6 +68,8 @@ kill_runtime_processes() {
 RM_SERVER_PID=""
 QUESTION_GEN_SERVER_PID=""
 QUESTION_EVAL_SERVER_PID=""
+CURRENT_ITER=""
+CURRENT_ITER_SYNCED=0
 
 start_questioner_rm_server() {
   local solver_model_path="$1"
@@ -183,6 +185,45 @@ stop_question_evaluate_server() {
   set -e
 }
 
+sync_wandb_stage_runs() {
+  local stage_dir="$1"
+  local stage_name="$2"
+
+  if ! command -v wandb >/dev/null 2>&1; then
+    echo "[main.sh] WARN: wandb CLI not found, skip ${stage_name} sync"
+    return 0
+  fi
+
+  if [ ! -d "${stage_dir}" ]; then
+    echo "[main.sh] No ${stage_name} wandb directory: ${stage_dir}"
+    return 0
+  fi
+
+  local -a run_dirs=()
+  mapfile -t run_dirs < <(find "${stage_dir}" -mindepth 1 -maxdepth 1 -type d \( -name 'offline-run-*' -o -name 'run-*' \) | sort)
+  if [ ${#run_dirs[@]} -eq 0 ]; then
+    echo "[main.sh] No ${stage_name} runs to sync in ${stage_dir}"
+    return 0
+  fi
+
+  local run_dir
+  for run_dir in "${run_dirs[@]}"; do
+    echo "[main.sh] Sync ${stage_name} run: ${run_dir}"
+    if ! wandb sync "${run_dir}"; then
+      echo "[main.sh] WARN: wandb sync failed for ${run_dir}"
+    fi
+  done
+}
+
+sync_iteration_wandb_runs() {
+  local iter_id="$1"
+  local iter_wandb_dir="${MAIN_WANDB_DIR}/iter_${iter_id}"
+
+  echo "[main.sh] Sync W&B runs for iter${iter_id}"
+  sync_wandb_stage_runs "${iter_wandb_dir}/questioner" "questioner"
+  sync_wandb_stage_runs "${iter_wandb_dir}/solver" "solver"
+}
+
 run_questioner_stage() {
   local solver_model_path="$1"
   local questioner_model_path="$2"
@@ -192,16 +233,22 @@ run_questioner_stage() {
   stage_gpus="$(unique_gpu_csv "${QUESTIONER_TRAIN_GPUS}" "${QUESTIONER_RM_GPUS}")"
   local rm_log="${MAIN_LOG_DIR}/questioner_rm_iter${iter_id}.log"
   local train_log="${MAIN_LOG_DIR}/questioner_train_iter${iter_id}.log"
+  local questioner_wandb_dir="${MAIN_WANDB_DIR}/iter_${iter_id}/questioner"
   local rm_url="http://${QUESTIONER_RM_HOST}:${QUESTIONER_RM_PORT}/generate"
+
+  mkdir -p "${questioner_wandb_dir}"
 
   kill_runtime_processes "before questioner_train iter${iter_id}" "${stage_gpus}"
   start_questioner_rm_server "${solver_model_path}" "${rm_log}"
 
   echo "[main.sh] Start questioner_train iter${iter_id} on GPUs ${QUESTIONER_TRAIN_GPUS}"
+  echo "[main.sh] Questioner WANDB_DIR: ${questioner_wandb_dir}"
   SLIME_ROOT="${SLIME_ROOT}" \
   SGLANG_PYTHONPATH="${SGLANG_PYTHONPATH}" \
   RZERO_ROOT="${RZERO_ROOT}" \
   SAVE_ROOT="${SAVE_ROOT}" \
+  WANDB_MODE="offline" \
+  WANDB_DIR="${questioner_wandb_dir}" \
   QUESTIONER_TRAIN_GPUS="${QUESTIONER_TRAIN_GPUS}" \
   RZERO_SOLVER_RM_URL="${rm_url}" \
   bash "${RZERO_ROOT}/scripts/questioner_train.sh" \
@@ -289,14 +336,21 @@ run_solver_stage() {
   local solver_model_path="$1"
   local questioner_hf_path="$2"
   local save_name="$3"
+  local iter_id="$4"
+  local solver_wandb_dir="${MAIN_WANDB_DIR}/iter_${iter_id}/solver"
+
+  mkdir -p "${solver_wandb_dir}"
 
   kill_runtime_processes "before solver_train ${save_name}" "${SOLVER_ALL_GPUS}"
   echo "[main.sh] Start solver_train on GPUs ${SOLVER_ALL_GPUS}"
+  echo "[main.sh] Solver WANDB_DIR: ${solver_wandb_dir}"
   SLIME_ROOT="${SLIME_ROOT}" \
   SGLANG_PYTHONPATH="${SGLANG_PYTHONPATH}" \
   RZERO_ROOT="${RZERO_ROOT}" \
   SAVE_ROOT="${SAVE_ROOT}" \
   STORAGE_PATH="${STORAGE_PATH}" \
+  WANDB_MODE="offline" \
+  WANDB_DIR="${solver_wandb_dir}" \
   SOLVER_ALL_GPUS="${SOLVER_ALL_GPUS}" \
   bash "${RZERO_ROOT}/scripts/solver_train.sh" \
     "${solver_model_path}" \
@@ -314,6 +368,12 @@ on_exit() {
   local exit_code=$?
   trap - EXIT INT TERM
   set +e
+
+  if [ "${exit_code}" -ne 0 ] && [ -n "${CURRENT_ITER:-}" ] && [ "${CURRENT_ITER_SYNCED:-0}" -eq 0 ]; then
+    echo "[main.sh] Iteration ${CURRENT_ITER} ended early; sync available W&B runs"
+    sync_iteration_wandb_runs "${CURRENT_ITER}"
+  fi
+
   stop_questioner_rm_server
   stop_question_generate_server
   stop_question_evaluate_server
@@ -371,7 +431,8 @@ QUESTION_EVAL_STAGE_TIMEOUT="${QUESTION_EVAL_STAGE_TIMEOUT:-0}"
 SOLVER_ALL_GPUS="${SOLVER_ALL_GPUS:-0,1,2,3,4,5,7}"
 
 MAIN_LOG_DIR="${MAIN_LOG_DIR:-/tmp/rzero_main}"
-mkdir -p "${SAVE_ROOT}" "${STORAGE_PATH}/solver_data" "${MAIN_LOG_DIR}"
+MAIN_WANDB_DIR="${MAIN_WANDB_DIR:-${MAIN_LOG_DIR}/wandb}"
+mkdir -p "${SAVE_ROOT}" "${STORAGE_PATH}/solver_data" "${MAIN_LOG_DIR}" "${MAIN_WANDB_DIR}"
 
 ALL_STAGE_GPUS="$(unique_gpu_csv "${QUESTIONER_TRAIN_GPUS}" "${QUESTIONER_RM_GPUS}" "${QUESTION_GEN_GPUS}" "${QUESTION_EVAL_GPUS}" "${SOLVER_ALL_GPUS}")"
 
@@ -387,6 +448,8 @@ echo "[main.sh] Solver GPUs: ${SOLVER_ALL_GPUS}"
 kill_runtime_processes "startup reset" "${ALL_STAGE_GPUS}"
 
 for i in $(seq 1 "${NUM_ITERS}"); do
+  CURRENT_ITER="${i}"
+  CURRENT_ITER_SYNCED=0
   export RZERO_ITER="${i}"
   prev=$((i - 1))
 
@@ -407,7 +470,9 @@ for i in $(seq 1 "${NUM_ITERS}"); do
   run_generation_stage "${questioner_hf_path}" "${solver_save_name}"
   run_evaluation_stage "${solver_model_path}" "${solver_save_name}"
   build_solver_data "${solver_save_name}"
-  run_solver_stage "${solver_model_path}" "${questioner_hf_path}" "${solver_save_name}"
+  run_solver_stage "${solver_model_path}" "${questioner_hf_path}" "${solver_save_name}" "${i}"
+  sync_iteration_wandb_runs "${i}"
+  CURRENT_ITER_SYNCED=1
 done
 
 echo "[main.sh] Training loop finished"

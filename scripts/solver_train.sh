@@ -132,11 +132,13 @@ CUSTOM_ARGS=(
 WANDB_PROJECT="${WANDB_PROJECT:-rzero}"
 WANDB_GROUP="${WANDB_GROUP:-${SAVE_NAME}}"
 WANDB_KEY="${WANDB_KEY:-}"
+WANDB_MODE="${WANDB_MODE:-offline}"
 WANDB_ARGS=(
   --use-wandb
   --wandb-project "${WANDB_PROJECT}"
   --wandb-group "${WANDB_GROUP}"
   --wandb-key "${WANDB_KEY}"
+  --wandb-mode "${WANDB_MODE}"
 )
 
 CUDA_VISIBLE_DEVICES="${SOLVER_ALL_GPUS}" ray start --head \
