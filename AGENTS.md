@@ -2,6 +2,12 @@
 
 This codebase used to be veRL based and can use `git diff` to check previous codes.
 
+## Planning Before Implementation
+Always propose a plan and get explicit approval before writing code. Never jump straight to implementation. When asked to investigate or design, provide analysis/architecture only — no code unless explicitly requested.
+
+## Simplicity Principle
+Always prefer the simplest viable solution. Avoid over-engineering with factory functions, multi-tier strategies, or complex abstractions. If the user asks you to simplify, take that as a strong signal your approach is wrong — don't just trim, fundamentally rethink.
+
 ## Project Structure & Module Organization
 `customization/` contains R-Zero training customization modules: `customization/questioner_data_source.py` for questioner prompt/data sampling, `customization/reward_model.py` for questioner/solver reward functions, and shared reward logic in `customization/math.py`. `scripts/` holds the training drivers and data utilities. `question_generate/` and `question_evaluate/` handle question generation and evaluation helpers. Assets live in `figs/`; repo-level config includes `requirements.txt` and `tokens.json`.
 

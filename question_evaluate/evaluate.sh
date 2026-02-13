@@ -15,11 +15,13 @@ fi
 
 SOLVER_URL="${QUESTION_EVAL_SOLVER_URL:-http://${QUESTION_EVAL_HOST}:${QUESTION_EVAL_PORT}/generate}"
 STAGE_TIMEOUT="${QUESTION_EVAL_STAGE_TIMEOUT}"
+QUESTION_BATCH="${QUESTION_EVAL_QUESTION_BATCH}"
 
 echo "[question_evaluate] save_name=${SAVE_NAME}"
 echo "[question_evaluate] shards=${SHARDS}, gpus=${QUESTION_EVAL_GPUS}"
 echo "[question_evaluate] solver_url=${SOLVER_URL}"
 echo "[question_evaluate] num_samples=${QUESTION_EVAL_NUM_SAMPLES}, max_new_tokens=${QUESTION_EVAL_MAX_NEW_TOKENS}"
+echo "[question_evaluate] question_batch_size=${QUESTION_BATCH}"
 echo "[question_evaluate] request_timeout=${QUESTION_EVAL_REQUEST_TIMEOUT}s, retries=${QUESTION_EVAL_REQUEST_RETRIES}"
 echo "[question_evaluate] stage_timeout=${STAGE_TIMEOUT}s"
 
@@ -40,6 +42,7 @@ for i in $(seq 0 $((SHARDS - 1))); do
     --request-timeout "${QUESTION_EVAL_REQUEST_TIMEOUT}" \
     --request-retries "${QUESTION_EVAL_REQUEST_RETRIES}" \
     --progress-every "${QUESTION_EVAL_PROGRESS_EVERY}" \
+    --question-batch-size "${QUESTION_BATCH}" \
     --suffix "${i}" \
     --save_name "${SAVE_NAME}" \
     --solver-url "${SOLVER_URL}" &

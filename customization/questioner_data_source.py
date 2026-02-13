@@ -73,3 +73,6 @@ class QuestionerDataSource(DataSource):
 
     def load(self, rollout_id=None):
         return None
+
+    def __len__(self) -> int:
+        return max(1, getattr(self.args, "rollout_batch_size", 1))

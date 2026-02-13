@@ -15,7 +15,6 @@ if (( SHARDS > ${#GPU_LIST[@]} )); then
   SHARDS="${#GPU_LIST[@]}"
 fi
 SGLANG_URL="${SGLANG_URL}"
-export SGLANG_URL
 
 pids=()
 for i in $(seq 0 $((SHARDS - 1))); do

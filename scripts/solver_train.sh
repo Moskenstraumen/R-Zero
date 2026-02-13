@@ -8,6 +8,7 @@ SAVE_NAME="$3"
 
 SLIME_ROOT="${SLIME_ROOT:-/root/slime}"
 SGLANG_PYTHONPATH="${SGLANG_PYTHONPATH:-/sgl-workspace/sglang/python}"
+
 SOLVER_REF_LOAD="${SOLVER_REF_LOAD:-/root/model/Qwen3-4B-Instruct-2507_torch_dist}"
 
 SOLVER_SAVE_DIR="${SAVE_ROOT}/${SAVE_NAME}"
@@ -58,9 +59,9 @@ ROLLOUT_ARGS=(
   --rollout-shuffle
   --num-rollout 1
   --num-steps-per-rollout 20
-  --rollout-batch-size 432
+  --rollout-batch-size 504
   --n-samples-per-prompt 5
-  --global-batch-size 108
+  --global-batch-size 126
   --rollout-max-response-len 4096
   --rollout-max-prompt-len 2048
   --balance-data
@@ -69,6 +70,8 @@ ROLLOUT_ARGS=(
 EVAL_ARGS=(
   --eval-interval 1
   --eval-prompt-data aime  /root/dataset/aime-2024/aime-2024.jsonl
+  --eval-input-key prompt
+  --eval-label-key label
   --n-samples-per-eval-prompt 8
   --eval-max-response-len 8192
   --eval-top-p 1
@@ -128,7 +131,7 @@ CUSTOM_ARGS=(
 
 WANDB_PROJECT="${WANDB_PROJECT:-rzero}"
 WANDB_GROUP="${WANDB_GROUP:-${SAVE_NAME}}"
-WANDB_KEY="${WANDB_KEY:-${WANDB_KEY:-}}"
+WANDB_KEY="${WANDB_KEY:-}"
 WANDB_ARGS=(
   --use-wandb
   --wandb-project "${WANDB_PROJECT}"
